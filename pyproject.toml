@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nbpress"
+dynamic = ["version"]
+description = "Publish tutorial notebooks from dev sources into Colab-ready copies and executed docs artifacts, with a staleness gate"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniel Dale" }]
+# tomllib
+requires-python = ">=3.11"
+# standard library only: the publisher, the stale check and the stripper run in pre-commit and docs jobs before any
+# project dependency is installed
+dependencies = []
+
+[project.optional-dependencies]
+# executing notebooks into docs artifacts; nothing else needs it
+render = ["papermill"]
+test = ["pytest>=8"]
+# papermill so pyright resolves the execution path
+dev = ["pytest>=8", "ruff", "pyright", "papermill"]
+
+[project.scripts]
+nbpress-publish = "nbpress.publish:main"
+nbpress-render = "nbpress.render:main"
+nbpress-strip = "nbpress.strip:main"
+
+[project.urls]
+Repository = "https://github.com/speediedan/nbpress"
+
+[tool.setuptools.dynamic]
+version = { attr = "nbpress.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nbpress"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"

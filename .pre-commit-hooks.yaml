@@ -1,0 +1,22 @@
+# Each hook runs from the consuming repository's root and reads its [tool.nbpress] table. pre-commit installs nbpress
+# into an isolated environment; none of these hooks needs the consuming project installed.
+- id: nbpress-strip
+  name: Strip notebook outputs (nbpress)
+  description: Clear code-cell outputs and volatile metadata. Exclude the docs-artifact lane, whose outputs are the content.
+  entry: nbpress-strip
+  language: python
+  files: \.ipynb$
+- id: nbpress-publish
+  name: Publish changed notebooks (nbpress)
+  description: Republish the dev notebooks whose content changed. Narrow `files` to the dev lane.
+  entry: nbpress-publish
+  language: python
+  files: \.ipynb$
+  pass_filenames: false
+- id: nbpress-check-stale
+  name: Check docs artifacts are current (nbpress)
+  description: Fail when a docs artifact is missing or no longer matches its published notebook.
+  entry: nbpress-render --check-stale
+  language: python
+  files: \.ipynb$
+  pass_filenames: false
