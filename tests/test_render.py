@@ -210,6 +210,77 @@ class TestHostPathNormalization:
         assert cfg.path_markers == ("publish/", "artifacts/")
 
 
+class TestCheckoutPaths:
+    """A path into a checkout is a working-copy name, meaningless to a reader and different on every render."""
+
+    @staticmethod
+    def _checkout(tmp_path: Path) -> Path:
+        root = _repo(tmp_path)
+        (root / "src" / "pkg").mkdir(parents=True)
+        (root / "src" / "pkg" / "config.py").write_text("")
+        return root
+
+    def test_paths_into_this_or_any_other_checkout_become_repository_relative(self, tmp_path):
+        root = self._checkout(tmp_path)
+        for token in (
+            f"{root.as_posix()}/src/pkg/config.py",
+            "/mnt/cache/someone/worktrees/scratch-12/src/pkg/config.py",
+            "~/repos/project/.claude/worktrees/lane-661/src/pkg/config.py",
+        ):
+            assert engine.checkout_relative(token, root) == "src/pkg/config.py", token
+
+    def test_paths_outside_any_checkout_are_left_alone(self, tmp_path):
+        root = self._checkout(tmp_path)
+        for token in (
+            "~/.venvs/dev/lib/python3.13/site-packages/torch/nn/module.py",
+            "/opt/venv/lib/python3.13/site-packages/src/pkg/config.py",  # installed, even though the tail matches
+            "~/.cache/huggingface/hub/models--org--name/config.json",
+            "/srv/other/src/pkg/missing.py",
+            "/srv/other/config.py",  # a one-segment tail is too weak to call a checkout
+        ):
+            assert engine.checkout_relative(token, root) is None, token
+
+    def test_normalization_rewrites_checkout_paths_in_every_text_field(self, tmp_path):
+        root = self._checkout(tmp_path)
+        location = "/mnt/cache/someuser/worktrees/it-951/src/pkg/config.py:271: UserWarning: x\n"
+        notebook = {
+            "cells": [
+                {
+                    "cell_type": "code",
+                    "outputs": [
+                        {"text": [location]},
+                        {"traceback": [f'  File "{location}"']},
+                        {"data": {"text/plain": location, "image/png": "iVBOR/abc/def"}},
+                    ],
+                }
+            ],
+            "metadata": {},
+        }
+        assert engine.normalize_host_paths(notebook, markers=(), user="someuser", root=root) == 3
+        outputs = notebook["cells"][0]["outputs"]
+        assert outputs[0]["text"] == ["src/pkg/config.py:271: UserWarning: x\n"]
+        assert outputs[1]["traceback"] == ['  File "src/pkg/config.py:271: UserWarning: x\n"']
+        assert outputs[2]["data"] == {
+            "text/plain": "src/pkg/config.py:271: UserWarning: x\n",
+            "image/png": "iVBOR/abc/def",
+        }
+        assert engine.normalize_host_paths(notebook, markers=(), user="someuser", root=root) == 0
+
+    def test_the_stale_check_fails_on_a_checkout_path_and_no_execute_clears_it(self, tmp_path, capsys):
+        """Positive control, then the remedy the message names, on the same artifact."""
+        root = self._checkout(tmp_path)
+        _write(root / "publish" / "lane" / "nb.ipynb", _notebook())
+        _write(root / "artifacts" / "lane" / "nb.ipynb", _notebook(["~/worktrees/it-951/src/pkg/config.py:9: W\n"]))
+        assert engine.main(["--check-stale"], root=root) == engine.DRIFT_EXIT_CODE
+        err = capsys.readouterr().err
+        assert "CHECKOUT PATH in artifact output" in err and "~/worktrees/it-951/src/pkg/config.py" in err
+        assert "--no-execute" in err
+        assert engine.main(["--no-execute"], root=root) == 0
+        written = json.loads((root / "artifacts" / "lane" / "nb.ipynb").read_text())
+        assert written["cells"][0]["outputs"][0]["text"] == ["src/pkg/config.py:9: W\n"]
+        assert engine.main(["--check-stale"], root=root) == 0
+
+
 class TestGenericConsumer:
     """A repository with no hooks gets the generic behavior."""
 

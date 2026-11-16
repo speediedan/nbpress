@@ -200,7 +200,56 @@ def _user_root_pattern(user: str) -> re.Pattern[str]:
     return re.compile(r"(?<![\w.:/])/(?:[\w.\-]+/)*?" + re.escape(user) + r"/")
 
 
-def normalize_host_paths(notebook: dict[str, Any], *, markers: tuple[str, ...], user: str | None = None) -> int:
+# An absolute or home-relative path in output text: a run of path segments starting at a `/` or `~/` that does not
+# follow a word character, a colon or another slash (so a URL's path is never one), stopping before a `:line` suffix.
+_PATH_TOKEN = re.compile(r"(?<![\w.:/])(?:~/|/)(?:[\w.\-]+/)+[\w.\-]+")
+# Installed copies of a package are not a checkout of this repository, even when their tail matches one of its files.
+_INSTALL_DIRS = frozenset({"site-packages", "dist-packages"})
+
+
+def checkout_relative(token: str, root: Path) -> str | None:
+    """The repository-relative form of ``token`` when it is a path into a checkout of the repository at ``root``.
+
+    A path is into a checkout when, outside any installed-package directory, some tail of it at least two segments
+    long names a file that exists under ``root``; the longest such tail is the answer. That covers the checkout the
+    render runs from and any other one (a scratch worktree, an editable install from a sibling worktree, a CI job
+    directory), none of whose names means anything to a reader. ``None`` for anything else: a virtualenv, a cache, a
+    path the repository does not hold.
+    """
+    parts = token.split("/")
+    if _INSTALL_DIRS.intersection(parts):
+        return None
+    for start in range(1, len(parts) - 1):
+        tail = parts[start:]
+        if all(tail) and (root.joinpath(*tail)).is_file():
+            return "/".join(tail)
+    return None
+
+
+def checkout_paths(text: str, root: Path) -> list[str]:
+    """Every path token in ``text`` that points into a checkout of the repository at ``root``."""
+    return [m.group(0) for m in _PATH_TOKEN.finditer(text) if checkout_relative(m.group(0), root) is not None]
+
+
+def _rewrite_checkout_paths(text: str, root: Path) -> str:
+    return _PATH_TOKEN.sub(lambda m: checkout_relative(m.group(0), root) or m.group(0), text)
+
+
+def _output_text_fields(cell: dict[str, Any]):
+    """``(container, key)`` for every text field of a cell's outputs: stream text, tracebacks and ``text/*`` data."""
+    for output in cell.get("outputs", []) or []:
+        for fld in ("text", "traceback"):
+            if fld in output:
+                yield output, fld
+        data = output.get("data") or {}
+        for mime in data:
+            if mime.startswith("text/"):
+                yield data, mime
+
+
+def normalize_host_paths(
+    notebook: dict[str, Any], *, markers: tuple[str, ...], user: str | None = None, root: Path | None = None
+) -> int:
     """Strip the executing host's identity out of what gets published.
 
     An artifact records WHERE it was rendered, which is whoever ran the render host that day. Two places
@@ -211,8 +260,10 @@ def normalize_host_paths(notebook: dict[str, Any], *, markers: tuple[str, ...], 
     tail starting at one of ``markers`` (the publish and artifact directories), the part true for every reader.
 
     Output TEXT carries absolute paths inside warning locations, e.g.
-    `.../src/pkg/config.py:222: UserWarning ...`. Only the user's root is replaced, leaving the rest intact,
-    because the file and line ARE the useful content of a warning.
+    `.../src/pkg/config.py:222: UserWarning ...`. The file and line ARE the useful content of a warning, so they
+    stay. Given ``root``, a path into any checkout of the repository becomes repository-relative
+    (`src/pkg/config.py:222`, see :func:`checkout_relative`): the checkout's own location is a working-copy name that
+    changes with every render. Any other path keeps everything but the user's root, which becomes `~/`.
 
     What this deliberately does NOT touch: `owner/repo` identifiers naming real published repositories the
     examples genuinely use, and prose in source cells. **They look alike to a grep and are opposites in
@@ -230,15 +281,21 @@ def normalize_host_paths(notebook: dict[str, Any], *, markers: tuple[str, ...], 
             if rel != val:
                 pm_meta[key] = rel
                 changed += 1
+
+    def swap(line: Any) -> Any:
+        if not isinstance(line, str):
+            return line
+        if root is not None:
+            line = _rewrite_checkout_paths(line, root)
+        return user_root.sub("~/", line)
+
     for cell in notebook.get("cells", []):
-        for output in cell.get("outputs", []) or []:
-            for fld in ("text", "traceback"):
-                lines = output.get(fld)
-                if isinstance(lines, list):
-                    swapped = [user_root.sub("~/", ln) if isinstance(ln, str) else ln for ln in lines]
-                    if swapped != lines:
-                        output[fld] = swapped
-                        changed += 1
+        for container, key in _output_text_fields(cell):
+            value = container[key]
+            swapped = [swap(ln) for ln in value] if isinstance(value, list) else swap(value)
+            if swapped != value:
+                container[key] = swapped
+                changed += 1
     return changed
 
 
@@ -283,6 +340,22 @@ def skipped_sections(artifact: dict[str, Any]) -> list[str]:
         text = captured_output_text({"cells": [cell]})
         found.extend(line.strip() for line in text.splitlines() if line.strip().startswith(SKIP_MARKER))
     return found
+
+
+def artifact_checkout_paths(artifact: dict[str, Any], root: Path) -> list[str]:
+    """Paths into a checkout of the repository left in an artifact's outputs, each listed once.
+
+    The renderer rewrites these on every write, so one surviving means the artifact was written by something else (an
+    older renderer, a hand edit) and the docs page shows a working-copy location.
+    """
+    found: dict[str, None] = {}
+    for cell in artifact.get("cells", []):
+        for container, key in _output_text_fields(cell):
+            value = container[key]
+            for line in value if isinstance(value, list) else [value]:
+                if isinstance(line, str):
+                    found.update(dict.fromkeys(checkout_paths(line, root)))
+    return list(found)
 
 
 def artifact_matches_source(artifact: dict[str, Any], source: dict[str, Any]) -> bool:
@@ -335,10 +408,12 @@ def execute(source: Path, target: Path, timeout: int, parameters: dict[str, Any]
 
 
 def check_stale(cfg: DocsConfig, notebooks: list[Path]) -> int:
-    """Report every drifted, missing or skip-carrying artifact by name; ``DRIFT_EXIT_CODE`` if there is any."""
+    """Report every drifted, missing, skip-carrying or checkout-path-carrying artifact by name; ``DRIFT_EXIT_CODE``
+    if there is any."""
     missing: list[str] = []
     stale: list[str] = []
     skipped: list[str] = []
+    checkout: list[str] = []
     hook_drift: list[str] = []
     notes: list[str] = []
     check = cfg.hooks.get("check")
@@ -355,6 +430,7 @@ def check_stale(cfg: DocsConfig, notebooks: list[Path]) -> int:
             stale.append(str(rel))
             continue  # a source-drifted artifact needs a rebuild regardless of its outputs
         skipped.extend(f"{rel}: {line}" for line in skipped_sections(artifact_nb))
+        checkout.extend(f"{rel}: {path}" for path in artifact_checkout_paths(artifact_nb, cfg.root))
         if check is None:
             continue
         for kind, message in check(artifact_nb, rel=str(rel), output_text=captured_output_text(artifact_nb)):
@@ -376,9 +452,14 @@ def check_stale(cfg: DocsConfig, notebooks: list[Path]) -> int:
             f"SKIPPED section in artifact (re-render it on a host with the access the section needs): {entry}",
             file=sys.stderr,
         )
+    for entry in checkout:
+        print(
+            f"CHECKOUT PATH in artifact output (normalize it: {cfg.render_command} --no-execute): {entry}",
+            file=sys.stderr,
+        )
     for message in hook_drift + notes:
         print(message, file=sys.stderr)
-    total = len(missing) + len(stale) + len(skipped) + len(hook_drift)
+    total = len(missing) + len(stale) + len(skipped) + len(checkout) + len(hook_drift)
     print(f"{total} stale or missing artifact(s); {len(notes)} note(s)")
     return DRIFT_EXIT_CODE if total else 0
 
@@ -441,7 +522,7 @@ def render(
             # stamp still describes them, and an artifact lands identically regardless of whose copy rendered it.
             if stamp is not None:
                 stamp(notebook)
-            normalize_host_paths(notebook, markers=cfg.path_markers)
+            normalize_host_paths(notebook, markers=cfg.path_markers, root=cfg.root)
             save_notebook(notebook, artifact)
             outputs = "with outputs" if has_outputs(notebook) else "NO outputs"
             print(f"  wrote {rel} ({outputs}, {removed} cell(s) removed)")
@@ -495,8 +576,8 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
         "--check-stale",
         action="store_true",
         help=f"Exit {DRIFT_EXIT_CODE} if any artifact has drifted from its publish source, is missing, carries a "
-        "skipped section, or fails a repository check. The docs render artifacts, so any of these means the site "
-        "is showing something stale with no build error.",
+        "skipped section or a path into a checkout, or fails a repository check. The docs render artifacts, so any "
+        "of these means the site is showing something stale with no build error.",
     )
     parser.add_argument(
         "--restamp",

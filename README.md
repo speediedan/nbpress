@@ -12,8 +12,9 @@ A repository using nbpress keeps each tutorial notebook in three lanes:
    weights, tokens).
 
 The staleness gate (`nbpress-render --check-stale`) fails, naming each notebook, when an artifact is missing, no
-longer matches its published source, or shows a section that skipped at render time. Each of these leaves a docs page
-showing something stale, with no error in the docs build.
+longer matches its published source, shows a section that skipped at render time, or names a path into a checkout of
+the repository (the renderer writes those repository-relative, since a working-copy location means nothing to a reader).
+Each of these leaves a docs page showing something stale or host-specific, with no error in the docs build.
 
 Other tools cover parts of this: nbstripout (stripping), papermill and nbconvert (execution), jupytext (pairing),
 nbsphinx, myst-nb and jupyter-book (rendering). nbpress adds the contract between the three lanes and the check that
